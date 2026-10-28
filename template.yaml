@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Plataforma de feedback - recebe avaliações das aulas, alerta sobre as críticas e envia um relatório semanal por e-mail.
+
+Parameters:
+  AdminEmail:
+    Type: String
+    Description: Destinatário dos alertas de urgência, relatórios semanais e alarmes operacionais.
+  SenderEmail:
+    Type: String
+    Description: Remetente verificado no SES.
+
+Globals:
+  Function:
+    Runtime: java17
+    Architectures: [arm64]
+    MemorySize: 512
+    Timeout: 30
+    Tracing: Active
+    Environment:
+      Variables:
+        JAVA_TOOL_OPTIONS: -XX:+TieredCompilation -XX:TieredStopAtLevel=1
+
+Resources:
+
+
+  FeedbackTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+
+  UrgencyTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: alias/aws/sns
+
+  UrgencyDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AdminEmail
+
+
+  FeedbackApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          ThrottlingRateLimit: 20
+          ThrottlingBurstLimit: 40
+          MetricsEnabled: true
+
+
+  ReceiveFeedbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Valida e grava o feedback; publica um evento de urgência quando ele é crítico.
+      CodeUri: receive-feedback-function/target/receive-feedback-function-1.0.0.jar
+      Handler: techchallenge.feedback.receive.ReceiveFeedbackHandler::handleRequest
+      Environment:
+        Variables:
+          FEEDBACK_TABLE_NAME: !Ref FeedbackTable
+          URGENCY_TOPIC_ARN: !Ref UrgencyTopic
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt FeedbackTable.Arn
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt UrgencyTopic.TopicName
+      Events:
+        PostFeedback:
+          Type: Api
+          Properties:
+            RestApiId: !Ref FeedbackApi
+            Path: /avaliacao
+            Method: post
+
+  NotifyUrgencyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Envia e-mail ao administrador para cada feedback crítico.
+      CodeUri: notify-urgency-function/target/notify-urgency-function-1.0.0.jar
+      Handler: techchallenge.feedback.urgency.NotifyUrgencyHandler::handleRequest
+      Environment:
+        Variables:
+          ADMIN_EMAIL: !Ref AdminEmail
+          SENDER_EMAIL: !Ref SenderEmail
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt UrgencyDeadLetterQueue.Arn
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource: !Sub arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*
+      Events:
+        UrgencyEvent:
+          Type: SNS
+          Properties:
+            Topic: !Ref UrgencyTopic
+
+  GenerateWeeklyReportFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Resume os feedbacks dos últimos 7 dias e envia o relatório por e-mail.
+      CodeUri: weekly-report-function/target/weekly-report-function-1.0.0.jar
+      Handler: techchallenge.feedback.report.GenerateWeeklyReportHandler::handleRequest
+      Timeout: 120
+      Environment:
+        Variables:
+          FEEDBACK_TABLE_NAME: !Ref FeedbackTable
+          ADMIN_EMAIL: !Ref AdminEmail
+          SENDER_EMAIL: !Ref SenderEmail
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:Scan
+              Resource: !GetAtt FeedbackTable.Arn
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource: !Sub arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*
+      Events:
+        EveryMonday:
+          Type: Schedule
+          Properties:
+            Description: Relatório semanal de feedbacks, segundas às 12:00 UTC.
+            Schedule: cron(0 12 ? * MON *)
+
+
+  ReceiveFeedbackLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ReceiveFeedbackFunction}
+      RetentionInDays: 30
+
+  NotifyUrgencyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${NotifyUrgencyFunction}
+      RetentionInDays: 30
+
+  GenerateWeeklyReportLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${GenerateWeeklyReportFunction}
+      RetentionInDays: 30
+
+  ReceiveFeedbackErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A ReceiveFeedbackFunction está falhando.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ReceiveFeedbackFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: O POST /avaliacao está retornando erros 5xx.
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref AWS::StackName
+        - Name: Stage
+          Value: prod
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  NotifyUrgencyErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A NotifyUrgencyFunction está falhando; alertas críticos podem não ser entregues.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref NotifyUrgencyFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  UrgencyDeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Alertas críticos foram para a fila de mensagens com falha (DLQ).
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt UrgencyDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  GenerateWeeklyReportErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: O relatório semanal falhou.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GenerateWeeklyReportFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+Outputs:
+  FeedbackEndpoint:
+    Description: Endpoint para enviar avaliações.
+    Value: !Sub https://${FeedbackApi}.execute-api.${AWS::Region}.amazonaws.com/prod/avaliacao
+  FeedbackTableName:
+    Value: !Ref FeedbackTable
+  UrgencyTopicArn:
+    Value: !Ref UrgencyTopic
