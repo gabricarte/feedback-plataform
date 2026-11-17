@@ -1,65 +1,66 @@
 # Feedback Platform — Tech Challenge Fase 4
 
-Plataforma serverless na AWS onde estudantes avaliam aulas e administradores recebem alertas de
-avaliações críticas e um relatório semanal.
+Plataforma serverless na AWS em que estudantes avaliam aulas e administradores recebem
+alertas de avaliações críticas e um relatório semanal.
 
-## Arquitetura
+- **Documentação completa:** [docs/documentacao.pdf](docs/documentacao.pdf)
+- **Vídeo de demonstração:** https://www.youtube.com/watch?v=DsFaaihU6cw
 
-```
-                 POST /avaliacao
-Estudante ──► API Gateway ──► ReceiveFeedbackFunction ──► DynamoDB (FeedbackTable)
-                                     │ nota 0–3 (HIGH)
-                                     ▼
-                              SNS (UrgencyTopic) ──► NotifyUrgencyFunction ──► SES ──► Admin
-                                                           │ falhou 3x
-                                                           ▼
-                                                     SQS (dead-letter)
+## Como funciona
 
-EventBridge (segunda 12:00 UTC) ──► GenerateWeeklyReportFunction ──► DynamoDB (scan 7 dias)
-                                                                  └─► SES ──► Admin
-
-CloudWatch: logs (30 dias), X-Ray, alarmes de erro ──► SNS (AlarmTopic) ──► e-mail do Admin
-```
-
-Modelo de nuvem: **serverless (FaaS + serviços gerenciados)** na AWS. Sem servidores para
-administrar, cobrança por uso, escala automática.
-
-| Função | Gatilho | Responsabilidade única |
-|---|---|---|
-| `ReceiveFeedbackFunction` | API Gateway `POST /avaliacao` | Validar, gravar e sinalizar feedback crítico |
-| `NotifyUrgencyFunction` | SNS `UrgencyTopic` | Enviar e-mail de urgência |
-| `GenerateWeeklyReportFunction` | EventBridge (semanal) | Montar e enviar o relatório semanal |
-
-### Regra de urgência
+1. O estudante envia descrição e nota pelo endpoint `POST /avaliacao`.
+2. O sistema grava a avaliação e calcula a urgência a partir da nota.
+3. Nota de 0 a 3 gera um e-mail de alerta imediato ao administrador.
+4. Toda segunda-feira o administrador recebe o relatório semanal, com a média e as contagens.
 
 | Nota | Urgência | Alerta imediato |
 |---|---|---|
-| 0–3 | `HIGH` (ALTA) | Sim |
-| 4–6 | `MEDIUM` (MÉDIA) | Não |
-| 7–10 | `LOW` (BAIXA) | Não |
+| 0 a 3 | ALTA | Sim |
+| 4 a 6 | MÉDIA | Não |
+| 7 a 10 | BAIXA | Não |
 
-## Estrutura do projeto
+## Arquitetura
 
-```
-feedback-platform/
-├── pom.xml                      # parent: versões e plugins
-├── template.yaml                # infraestrutura (AWS SAM)
-├── .github/workflows/deploy.yml # CI/CD
-├── feedback-core/               # domínio + adaptadores compartilhados
-│   └── techchallenge.feedback.core
-│       ├── domain/              # Feedback, UrgencyLevel, InvalidFeedbackException
-│       ├── repository/          # FeedbackRepository + implementação DynamoDB
-│       ├── notification/        # EmailSender + implementação SES
-│       ├── config/  json/       # variáveis de ambiente, logs, ObjectMapper
-├── receive-feedback-function/   # Lambda 1 (+ publicador SNS)
-├── notify-urgency-function/     # Lambda 2 (+ conteúdo do e-mail de alerta)
-├── weekly-report-function/      # Lambda 3 (+ WeeklyReport e e-mail do relatório)
-└── test-support/                # fakes em memória usados só nos testes
+```mermaid
+flowchart TB
+  A[Estudante] -->|POST /avaliacao| B[API Gateway]
+  B --> C[ReceiveFeedbackFunction]
+  C -->|grava| D[(DynamoDB)]
+  C -->|nota 0 a 3| E[SNS UrgencyTopic]
+  E --> F[NotifyUrgencyFunction]
+  F -->|e-mail de alerta| G[SES]
+  F -.->|falhou 3 vezes| Q[SQS fila de falhas]
+  H[EventBridge - toda segunda] --> I[GenerateWeeklyReportFunction]
+  I -->|lê 7 dias| D
+  I -->|e-mail do relatório| G
+  G --> J[Administrador]
 ```
 
-Cada função gera seu próprio JAR e só carrega o que usa.
+## Funções
 
-## API
+| Função | Gatilho | Responsabilidade |
+|---|---|---|
+| `ReceiveFeedbackFunction` | API Gateway, `POST /avaliacao` | Validar e gravar a avaliação; sinalizar quando é crítica |
+| `NotifyUrgencyFunction` | Tópico SNS de urgência | Enviar o e-mail de alerta ao administrador |
+| `GenerateWeeklyReportFunction` | EventBridge, toda segunda-feira | Montar e enviar o relatório semanal |
+
+## Tecnologias
+
+Java 17, Maven, AWS Lambda, API Gateway, DynamoDB, SNS, SQS, SES, EventBridge, CloudWatch,
+AWS SAM / CloudFormation e JUnit 5.
+
+## Estrutura
+
+```
+feedback-core/               domínio e acesso ao DynamoDB e ao SES (compartilhado)
+receive-feedback-function/   função 1: recebe a avaliação
+notify-urgency-function/     função 2: alerta de urgência
+weekly-report-function/      função 3: relatório semanal
+test-support/                simuladores usados nos testes
+template.yaml                infraestrutura AWS
+```
+
+## Exemplo de requisição
 
 ```http
 POST /avaliacao
@@ -68,52 +69,30 @@ Content-Type: application/json
 { "descricao": "A aula foi ótima", "nota": 9 }
 ```
 
-| Status | Quando |
-|---|---|
-| `201` | `{"id": "...", "message": "Feedback registrado com sucesso."}` |
-| `400` | Corpo vazio, JSON inválido, `descricao` em branco, `nota` ausente, fora de 0–10 ou não inteira |
-| `500` | Falha de infraestrutura (detalhes só no log) |
+Resposta `201`:
 
-## Deploy
-
-Pré-requisitos: Java 17, Maven 3.9+, AWS SAM CLI, credenciais AWS.
-
-1. Verifique no SES os e-mails do remetente e do administrador (no sandbox do SES os dois precisam estar verificados).
-2. Gere os JARs e rode os testes:
-   ```bash
-   mvn package
-   ```
-3. Publique:
-   ```bash
-   sam deploy --guided --stack-name feedback-platform --capabilities CAPABILITY_IAM
-   ```
-4. Confirme a inscrição no e-mail "AWS Notification - Subscription Confirmation" (alarmes).
-
-Deploy automático: o workflow `.github/workflows/deploy.yml` roda build e testes em todo push/PR
-e faz `sam deploy` a cada push na `main`. Ele usa OIDC (sem chaves fixas no GitHub). Configure:
-`secrets.AWS_DEPLOY_ROLE_ARN`, `vars.AWS_REGION`, `vars.ADMIN_EMAIL`, `vars.SENDER_EMAIL`.
-
-Teste rápido:
-```bash
-curl -X POST "$ENDPOINT" -H 'Content-Type: application/json' -d '{"descricao":"Sem áudio","nota":1}'
+```json
+{ "id": "...", "message": "Feedback registrado com sucesso." }
 ```
 
-## Segurança e governança
+## Como executar
 
-- IAM com menor privilégio: cada função só tem as ações que usa (`PutItem`, `Scan`, `sns:Publish`, `ses:SendEmail`).
-- Dados criptografados em repouso: DynamoDB (SSE), SNS (KMS), SQS (SSE). Em trânsito: HTTPS.
-- Backup: Point-in-time recovery na tabela; `DeletionPolicy: Retain`.
-- Throttling na API (20 req/s, pico 40).
-- Nada sensível nos logs nem nas respostas de erro 500.
+Pré-requisitos: Java 17, Maven 3.9+, AWS SAM CLI e dois e-mails verificados no Amazon SES
+(remetente e administrador).
 
-## Monitoramento
-
-- CloudWatch Logs de cada função (retenção 30 dias) e tracing X-Ray.
-- Alarmes por e-mail: erros em cada Lambda, 5xx na API e mensagens na dead-letter queue de alertas.
-
-## Testes
+Gerar os pacotes e rodar os testes:
 
 ```bash
-mvn test
+mvn package
 ```
-Os testes usam fakes em memória (`test-support`), sem acessar a AWS.
+
+Publicar na AWS:
+
+```bash
+sam deploy --guided --stack-name feedback-platform --capabilities CAPABILITY_IAM
+```
+
+Ao final, a URL da API aparece na saída `FeedbackEndpoint`.
+
+Os detalhes de deploy, segurança e monitoramento estão na
+[documentação completa](docs/documentacao.pdf).
