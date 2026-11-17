@@ -27,7 +27,7 @@ jobs:
           path: '*-function/target/*-function-1.0.0.jar'
 
   deploy:
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.AWS_REGION != ''
     needs: build
     runs-on: ubuntu-latest
     environment: production
